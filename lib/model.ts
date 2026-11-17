@@ -21,6 +21,24 @@
 // so a reader can check the arithmetic. An implied value is this entry's own
 // claim about what a launch would be worth if the record stayed as it is —
 // never a prediction that a token is issued, or when.
+//
+// Calibration notes — the numbers the snapshot itself yields.
+//   The overall median market-cap / TVL across the snapshot's 120 live-token
+//   protocols is 0.246x. Per-category medians, winsorized to [0.005, 3.0] and
+//   shrunk toward that overall median with a prior of 3, come out as:
+//     Dexs 0.322x · Lending 0.151x · Liquid Staking 0.092x · RWA 0.267x
+//     CDP 0.207x · Basis Trading 0.532x
+//   Risk Curators (1 live comp) and Onchain Capital Allocator (2 live comps)
+//   fall back to the overall median: a single outlier — api3 at 2.98x — must
+//   not set a multiple on its own. Every multiple is clamped to [0.02, 1.50].
+//   The winsorization and the 3-comp minimum exist because of that outlier:
+//   without them the board would rank a category by its oldest survivor,
+//   not by its market. Growth is the 7-day TVL change clamped to [-50, 100]
+//   and weighted 0.4, so a hot week lifts a row but cannot double it.
+//   Maturity rewards age up to three years and then stops: unknown age
+//   counts as 365 days. Chain diversity adds 3% per extra chain up to
+//   five, capped at 1.15 — a protocol on many chains is worth more than
+//   the same TVL on one, but not much more.
 
 /** One protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {

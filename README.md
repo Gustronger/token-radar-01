@@ -46,6 +46,53 @@ An implied value is this entry's own claim about what a launch would be worth
 if the record stayed as it is — never a prediction that a token is issued, or
 when.
 
+## Calibration
+
+The multiples below are the medians the snapshot itself yields: market cap /
+TVL of the live-token protocols in each category, winsorized to [0.005, 3.0]
+and shrunk toward the overall median with a prior of 3. The overall median
+across the snapshot's 120 live-token protocols is **0.246x**.
+
+| Category | Multiple |
+| --- | --- |
+| Dexs | 0.322x |
+| Lending | 0.151x |
+| Liquid Staking | 0.092x |
+| RWA | 0.267x |
+| CDP | 0.207x |
+| Basis Trading | 0.532x |
+| Every other category | 0.246x (the overall median) |
+
+Risk Curators (1 live comp) and Onchain Capital Allocator (2 live comps) fall
+back to the overall median: with fewer than 3 live comps a category takes
+the overall median outright, so a single legacy deployment cannot set a
+multiple on its own — one outlier, api3 at 2.98x, would otherwise have set
+its whole category. Every multiple is clamped to [0.02, 1.50].
+
+Growth is the 7-day TVL change clamped to [-50, 100] and weighted 0.4, so a
+hot week lifts a row but cannot double it. Maturity rewards age up to three
+years and then stops (0.6 + min(age, 1095) / 1095 x 0.4; unknown age 365
+days). Chain diversity adds 3% per extra chain up to five, capped at 1.15.
+
+## Farm plans
+
+Every row carries a six-step farm plan, derived from the protocol's own
+record — its category, its chains, its TVL and its age. A protocol on more
+than one chain gets a multi-chain second step; a young protocol's plan leans
+on the basics, an old one's on depth. Each step is 20–600 characters. No
+step promises an airdrop or a token: the plan says what to do so the
+activity is on record if the protocol ever rewards it.
+
+## Reading the board
+
+Sort by implied value, or by any column; filter by category, by chain, or by
+scope (watchlist vs early). A row's badge says whether it is on the house
+watchlist or an early find. Opening a row shows the full model breakdown —
+every multiplier next to the number it produced — the live-token
+comparables that set its multiple, and its farm plan. The Multiple column
+recomputes from the board's own figures, so the detail view always shows
+the same number board.json carries.
+
 ## The dashboard
 
 `dashboard/` is a static page (no framework, no network): a sortable, searchable
