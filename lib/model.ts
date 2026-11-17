@@ -1,4 +1,4 @@
-// Token Radar model v2 (radar-2): one sealed snapshot in, one ranked board out.
+// Token Radar model v3 (radar-3): one sealed snapshot in, one ranked board out.
 //
 // The board ranks every pre-token protocol the snapshot can score — the house
 // watchlist is the floor, never the ceiling — and values each one from the
@@ -7,31 +7,46 @@
 //   multiple   = the category's median market-cap / TVL across live-token
 //                protocols in the same snapshot, winsorized to [0.005, 3.0]
 //                so one legacy deployment cannot set it, and shrunk toward
-//                the overall median when the category has few live comps.
-//                A category with fewer than 3 live comps takes the overall
-//                median outright. Every multiple is clamped to [0.02, 1.50].
+//                the overall median with a prior of 3 at every comp count:
+//                multiple = (n * median + 3 * overall) / (n + 3).
+//                A 1-comp category at 2.97x lands near 0.93x, a 2-comp
+//                category at 0.013x near 0.15x — the comps pull the multiple
+//                part-way instead of snapping to the overall median, and a
+//                single outlier still cannot set a category on its own.
+//                Every multiple is clamped to [0.02, 1.50].
 //   growth     = clamp(change_7d, -50, 100) per cent, null counts as 0.
 //   growthMult = 1 + (growth / 100) * 0.4
 //   maturity   = 0.6 + min(age_days, 1095) / 1095 * 0.4 (age unknown: 365 days)
 //   chains     = 1 + 0.03 * min(chains - 1, 5), capped at 1.15
 //   implied    = max(1, round(tvl_usd * multiple * growthMult * maturity * chains))
 //
-// No protocol name is ever special-cased: the same function scores every row,
-// and every multiplier a row carries is printed in the dashboard next to it,
-// so a reader can check the arithmetic. An implied value is this entry's own
+// No protocol name is ever special-cased in the ranking math: the same
+// function scores every row, and every multiplier a row carries is printed
+// in the dashboard next to it, so a reader can check the arithmetic. The one
+// exception is RECORD_FLAGS below, a hand-written record check, not a ranking
+// tweak: three slugs the snapshot records as pre-token whose token is known
+// to trade already (USDD, Bittensor dTAO, Plume Vaults). Flagged rows keep
+// exactly the value the model computes — no haircut — and carry a visible
+// `record_flag` so the reader is told the record is disputed instead of
+// being shown a silent "no token". An implied value is this entry's own
 // claim about what a launch would be worth if the record stayed as it is —
 // never a prediction that a token is issued, or when.
 //
 // Calibration notes — the numbers the snapshot itself yields.
-//   The overall median market-cap / TVL across the snapshot's 120 live-token
+//   The overall median market-cap / TVL across the snapshot's 119 live-token
 //   protocols is 0.246x. Per-category medians, winsorized to [0.005, 3.0] and
 //   shrunk toward that overall median with a prior of 3, come out as:
 //     Dexs 0.322x · Lending 0.151x · Liquid Staking 0.092x · RWA 0.267x
-//     CDP 0.207x · Basis Trading 0.532x
-//   Risk Curators (1 live comp) and Onchain Capital Allocator (2 live comps)
-//   fall back to the overall median: a single outlier — api3 at 2.98x — must
-//   not set a multiple on its own. Every multiple is clamped to [0.02, 1.50].
-//   The winsorization and the 3-comp minimum exist because of that outlier:
+//     CDP 0.207x · Basis Trading 0.532x · Risk Curators 0.928x (n=1, api3)
+//     Onchain Capital Allocator 0.153x (n=2) · Derivatives 1.012x (n=2)
+//     Prediction Market 0.935x (n=1, rain winsorized 400.20x -> 3.0x)
+//     Chain 0.935x (n=1) · Collateral Management 0.935x (n=1)
+//   Every row carries its comp count (`multiple_n`) and a note
+//   ("n=3, median 0.169x, shrunk to 0.207x"), so a multiple built on one
+//   comp reads as low-confidence rather than as a measurement. Categories
+//   with no live comps at all (14 of the board's 36) take the overall
+//   median and say so: "n=0, no live comps".
+//   The winsorization and the shrinkage exist because of the outliers:
 //   without them the board would rank a category by its oldest survivor,
 //   not by its market. Growth is the 7-day TVL change clamped to [-50, 100]
 //   and weighted 0.4, so a hot week lifts a row but cannot double it.
@@ -39,6 +54,18 @@
 //   counts as 365 days. Chain diversity adds 3% per extra chain up to
 //   five, capped at 1.15 — a protocol on many chains is worth more than
 //   the same TVL on one, but not much more.
+//
+// Farm plans — six steps per row, derived from the protocol's own record
+// (category, chains, TVL, age), never from a hand-written list of names,
+// and never promising an airdrop. Steps 3–5 are category-aware: perps get a
+// hedge/funding cadence and a close-out (never a 30-day hold), prediction
+// markets get market selection and resolution tracking, RWA gets term and
+// redemption, staking/restaking gets receipt and reward cadence with no
+// borrow leg, curator vaults get vault selection and share tracking, and
+// CDP/stablecoin rows get mint-and-hold against collateral. Gas is
+// chain-aware (Ethereum ~$5, Tron ~$2, Solana ~$0.01, Binance ~$0.30,
+// other chains ~$0.10 a transaction — orders of magnitude, not quotes).
+// Step 1 (fresh wallet) and step 6 (farm log) are unchanged.
 
 /** One protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -93,6 +120,9 @@ export const MODEL: ModelConstants = {
   chain_step: 0.03,
   chain_cap: 1.15,
   shrink_prior: 3,
+  // Retained for the dashboard's model panel, which states the prior; the
+  // shrink no longer gates on it — it applies at every comp count (see
+  // calibrationByCategory). Removing the field would break the panel text.
   min_category_comps: 3,
   ratio_floor: 0.005,
   ratio_cap: 3.0,
@@ -101,10 +131,40 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
+
+/** A record check: the snapshot records no token for this protocol, but its token is known to trade already. Disclosure only — it never changes the row's value. */
+export interface RecordFlag {
+  kind: 'token-trades';
+  note: string;
+}
+
+/**
+ * The hand-written record-check list. Three slugs the snapshot records as
+ * pre-token whose token is known to trade already — the rules warn that
+ * DefiLlama's record is not proof, so the entry checks the record instead
+ * of copying it. USDD and bittensor-dtao are on the house watchlist and
+ * cannot be removed; plume-vaults is an early row and is kept for coverage.
+ * Flagged rows keep exactly the value the model computes (no haircut); the
+ * flag is the fix, carried as a badge and a drawer note by the dashboard.
+ */
+export const RECORD_FLAGS: Record<string, RecordFlag> = {
+  usdd: {
+    kind: 'token-trades',
+    note: 'Record check: USDD is a stablecoin — the token is USDD itself and it trades, although the snapshot records no token for it. The implied value shown is the snapshot record’s claim, not a launch.',
+  },
+  'bittensor-dtao': {
+    kind: 'token-trades',
+    note: 'Record check: dTAO is Bittensor’s subnet-token mechanism and the protocol’s token, TAO, already trades, although the snapshot records no token for it. The implied value shown is the snapshot record’s claim, not a launch.',
+  },
+  'plume-vaults': {
+    kind: 'token-trades',
+    note: 'Record check: the PLUME token already trades. Plume Vaults is the vault product, which records no token of its own, so this is a weaker case than USDD or dTAO — but the flag is shown so the record is not taken at face value.',
+  },
+};
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -138,7 +198,13 @@ export interface BoardRow {
     maturity_multiplier: number;
     chain_multiplier: number;
     age_days: number | null;
+    /** Live comps behind this row's multiple (0 when the category has none). */
+    multiple_n: number;
+    /** How the multiple was built, e.g. "n=3, median 0.169x, shrunk to 0.207x". */
+    multiple_note: string;
   };
+  /** Set only by the RECORD_FLAGS record check; null on every other row. */
+  record_flag: RecordFlag | null;
   farm_steps: string[];
 }
 
@@ -160,6 +226,12 @@ export interface RadarRow {
   maturity_multiplier: number;
   chain_multiplier: number;
   watchlist: boolean;
+  /** Live comps behind this row's multiple (0 when the category has none). */
+  multiple_n: number;
+  /** How the multiple was built, e.g. "n=3, median 0.169x, shrunk to 0.207x". */
+  multiple_note: string;
+  /** Set only by the RECORD_FLAGS record check; null on every other row. */
+  record_flag: RecordFlag | null;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -171,6 +243,30 @@ export interface LiveRow {
   tvl_usd: number;
   mcap_usd: number | null;
   change_7d: number | null;
+}
+
+/** One live-token comp inside a category's calibration set, by market cap. */
+export interface LiveComp {
+  slug: string;
+  name: string;
+  mcap_usd: number;
+  tvl_usd: number;
+  ratio_winsorized: number;
+  ratio_raw: number;
+}
+
+/** A category's calibration: the comps, their medians, and the multiple they set. */
+export interface CategoryCalibration {
+  /** Live comps in this category (all of them; `comps` below is capped at 5). */
+  n: number;
+  /** Median of the raw mcap/TVL ratios. */
+  median_raw: number;
+  /** Median of the winsorized ratios — the number the shrink starts from. */
+  median_winsorized: number;
+  /** The multiple: median winsorized, shrunk toward the overall with prior 3, clamped to [0.02, 1.50]. */
+  multiple: number;
+  /** Live comps by market cap desc, capped at 5. */
+  comps: LiveComp[];
 }
 
 /** Everything the dashboard needs: the board, the live set, and the model it runs. */
@@ -188,6 +284,11 @@ export interface RadarData {
   live_size: number;
   rows: RadarRow[];
   live: LiveRow[];
+  /** The real calibration set per category with live comps: every live comp
+      (capped at 5, by market cap desc) with its raw and winsorized ratio,
+      plus the category's n, medians and multiple. The dashboard's detail
+      drawer reads this — not the top-24 `live` table — for comparables. */
+  liveByCategory: Record<string, CategoryCalibration>;
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -272,14 +373,21 @@ export function isRankable(p: SnapshotProtocol): boolean {
  * legacy deployment (a token whose market cap belongs to a whole protocol, not
  * the small deployment that carries it) cannot set a category on its own.
  * Each category's multiple is the median of its winsorized ratios, shrunk
- * toward the overall median; a category with fewer than min_category_comps
- * live comps takes the overall median outright. Every multiple is clamped to
- * [multiple_floor, multiple_cap].
+ * toward the overall median with a prior of 3 at EVERY comp count:
+ *   multiple = (n * median_winsorized + 3 * overall) / (n + 3)
+ * so a 1-comp category at 2.97x lands near 0.93x and a 2-comp category at
+ * 0.013x near 0.15x — the comps pull the multiple part-way instead of
+ * snapping to the overall median, while a single outlier still cannot set
+ * a category on its own. (The old hard fallback — n<3 takes the overall
+ * median outright — valued 107 of 227 rows, 8 of the top 10, on an
+ * undifferentiated 0.246x.) Every multiple is clamped to
+ * [multiple_floor, multiple_cap]. The full calibration set is returned so
+ * the dashboard can show the comps that set each multiple.
  */
-export function categoryMultiples(
+export function calibrationByCategory(
   protocols: SnapshotProtocol[],
   model: ModelConstants = MODEL,
-): { overall: number; byCategory: Map<string, number> } {
+): { overall: number; byCategory: Map<string, CategoryCalibration> } {
   const winsorize = (r: number): number =>
     Math.min(model.ratio_cap, Math.max(model.ratio_floor, r));
   const live = protocols.filter(
@@ -289,32 +397,81 @@ export function categoryMultiples(
     .map((p) => winsorize(p.mcap_usd! / p.tvl_usd))
     .sort((a, b) => a - b);
   const overall = median(allRatios);
-  const byCat = new Map<string, number[]>();
+  const byCat = new Map<string, SnapshotProtocol[]>();
   for (const p of live) {
     const key = p.category ?? 'Unknown';
     const list = byCat.get(key);
-    if (list === undefined) byCat.set(key, [winsorize(p.mcap_usd! / p.tvl_usd)]);
-    else list.push(winsorize(p.mcap_usd! / p.tvl_usd));
+    if (list === undefined) byCat.set(key, [p]);
+    else list.push(p);
   }
-  const byCategory = new Map<string, number>();
-  for (const [key, ratios] of byCat) {
-    const sorted = [...ratios].sort((a, b) => a - b);
-    if (sorted.length < model.min_category_comps) {
-      byCategory.set(
-        key,
-        Math.min(model.multiple_cap, Math.max(model.multiple_floor, overall)),
-      );
-      continue;
-    }
-    const catMedian = median(sorted);
-    const n = sorted.length;
-    const shrunk = (n * catMedian + model.shrink_prior * overall) / (n + model.shrink_prior);
-    byCategory.set(
-      key,
-      Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk)),
+  const byCategory = new Map<string, CategoryCalibration>();
+  for (const [key, members] of byCat) {
+    const raw = members.map((p) => p.mcap_usd! / p.tvl_usd).sort((a, b) => a - b);
+    const winsorized = members
+      .map((p) => winsorize(p.mcap_usd! / p.tvl_usd))
+      .sort((a, b) => a - b);
+    const n = members.length;
+    const medianWinsorized = median(winsorized);
+    const shrunk =
+      (n * medianWinsorized + model.shrink_prior * overall) / (n + model.shrink_prior);
+    const multiple = Math.min(
+      model.multiple_cap,
+      Math.max(model.multiple_floor, shrunk),
     );
+    const comps = [...members]
+      .sort((a, b) => b.mcap_usd! - a.mcap_usd! || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
+      .slice(0, 5)
+      .map((p) => ({
+        slug: p.slug,
+        name: p.name,
+        mcap_usd: p.mcap_usd!,
+        tvl_usd: p.tvl_usd,
+        ratio_winsorized: winsorize(p.mcap_usd! / p.tvl_usd),
+        ratio_raw: p.mcap_usd! / p.tvl_usd,
+      }));
+    byCategory.set(key, {
+      n,
+      median_raw: median(raw),
+      median_winsorized: medianWinsorized,
+      multiple,
+      comps,
+    });
   }
   return { overall, byCategory };
+}
+
+/**
+ * The valuation multiples, as a plain overall + per-category map — the shape
+ * the scoring functions take. Built on calibrationByCategory, so the numbers
+ * are the same ones the dashboard's liveByCategory shows.
+ */
+export function categoryMultiples(
+  protocols: SnapshotProtocol[],
+  model: ModelConstants = MODEL,
+): { overall: number; byCategory: Map<string, number> } {
+  const { overall, byCategory: detail } = calibrationByCategory(protocols, model);
+  const byCategory = new Map<string, number>();
+  for (const [key, cal] of detail) byCategory.set(key, cal.multiple);
+  return { overall, byCategory };
+}
+
+/** How one category's multiple was built, for the row and the multiples table. */
+export function multipleNote(
+  category: string | null,
+  detail: Map<string, CategoryCalibration>,
+  overall: number,
+): { n: number; note: string } {
+  const cal = detail.get(category ?? 'Unknown');
+  if (cal === undefined) {
+    return {
+      n: 0,
+      note: `n=0, no live comps — overall median ${overall.toFixed(3)}x`,
+    };
+  }
+  return {
+    n: cal.n,
+    note: `n=${cal.n}, median ${cal.median_winsorized.toFixed(3)}x, shrunk to ${cal.multiple.toFixed(3)}x`,
+  };
 }
 
 /** The multiple one protocol's category carries, or the overall median. */
@@ -384,6 +541,7 @@ export function buildBoard(
   model: ModelConstants = MODEL,
 ): BoardRow[] {
   const multiples = categoryMultiples(snapshot.protocols, model);
+  const { overall, byCategory: detail } = calibrationByCategory(snapshot.protocols, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug it names is ranked, even one the
@@ -410,7 +568,9 @@ export function buildBoard(
     (a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0),
   );
   const watchlist = new Set(snapshot.watchlist);
-  return scored.map((s, i) => ({
+  return scored.map((s, i) => {
+    const { n, note } = multipleNote(s.p.category, detail, overall);
+    return {
     rank: i + 1,
     slug: s.p.slug,
     name: s.p.name,
@@ -436,9 +596,15 @@ export function buildBoard(
       maturity_multiplier: round4(s.maturityMult),
       chain_multiplier: round4(s.chainMult),
       age_days: s.age,
+      multiple_n: n,
+      multiple_note: note,
     },
+    // Record check only: the flag never changes the value — the model scores
+    // flagged rows exactly as it scores every other row.
+    record_flag: RECORD_FLAGS[s.p.slug] ?? null,
     farm_steps: farmSteps(s.p, s.age).map(stepText),
-  }));
+    };
+  });
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -472,20 +638,53 @@ function holdDaysFor(age: number | null): number {
   return 30;
 }
 
-/** The category's one action, in the words a farmer can follow. */
+/** What one transaction costs on a chain, order of magnitude — not a quote. */
+function gasFor(chain: string): { setup: string; weekly: string } {
+  switch (chain) {
+    case 'Ethereum':
+      return { setup: '$5', weekly: '$3' };
+    case 'Tron':
+      return { setup: '$2', weekly: '$1' };
+    case 'Bitcoin':
+      return { setup: '$2', weekly: '$1' };
+    case 'Solana':
+      return { setup: '$0.01', weekly: '$0.01' };
+    case 'Binance':
+      return { setup: '$0.30', weekly: '$0.20' };
+    default:
+      // Every other chain in the snapshot is a low-fee L1/L2 (Base, Arbitrum,
+      // Optimism, Avalanche, Polygon, Sonic, Monad, Hyperliquid L1, …):
+      // a transaction there is cents, not dollars.
+      return { setup: '$0.10', weekly: '$0.10' };
+  }
+}
+
+/** The category's one action, in the words a farmer can follow. Branches are
+ *  on the category, never on a name — except that the row's own name and
+ *  chain are written into the step, as every step does. Order matters: the
+ *  specific branches (CDP, lending, collateral) come before the general
+ *  ones (bridge, chain), so "Collateral Markets" never falls into lending,
+ *  "Uncollateralized Lending" never falls into the collateral branch
+ *  ("uncollateralized" contains "collateral"), and "Cross Chain Bridge"
+ *  never falls into the Chain action; likewise "Indexes" is checked before
+ *  the dex branch ("indexes" contains "dex"). */
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) {
+  if (c.includes('cdp')) {
+    // A CDP mints a stablecoin against collateral: there is no USDC-supply
+    // and-borrow leg. (USDD is the CDP case the old lending branch got wrong.)
+    return `Deposit $${capital} of collateral through ${name} on ${chain}, mint the stablecoin it issues against that collateral, and hold the minted coins.`;
+  }
+  if (c.includes('lend')) {
+    // Before the collateral branch: "uncollateralized" contains "collateral".
     return `Supply $${capital} of USDC to ${name} on ${chain}, borrow a small amount against it, and keep both legs open.`;
   }
-  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) {
-    return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open through a full fee cycle.`;
+  if (c.includes('collateral')) {
+    // Restaking/collateral markets: the deposit secures networks. No borrow leg.
+    return `Deposit $${capital} of collateral assets through ${name} on ${chain} to secure the networks it covers, and keep the deposit staked.`;
   }
-  if (c.includes('bridge')) {
-    return `Bridge $${capital} of USDC to ${chain} through ${name}, then use the bridged funds in an app on that chain.`;
-  }
-  if (c.includes('staking') || c.includes('restak')) {
+  if (c.includes('restak') || c.includes('staking')) {
     return `Stake $${capital} of the chain's staking asset through ${name} and keep the receipt token in your wallet.`;
   }
   if (c.includes('perpetual') || c.includes('derivative')) {
@@ -509,7 +708,308 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   if (c.includes('basis') || c.includes('yield aggregator')) {
     return `Deposit $${capital} into ${name}'s main strategy on ${chain} and leave it running.`;
   }
+  if (c.includes('index')) {
+    // Before the dex branch: "indexes" contains the substring "dex".
+    return `Buy $${capital} of the ${name} index token on ${chain} and hold it through one rebalance.`;
+  }
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) {
+    return `Provide $${capital} of liquidity to ${name}'s main pool on ${chain} and keep the position open through a full fee cycle.`;
+  }
+  if (c.includes('liquidity manager')) {
+    return `Deposit $${capital} of USDC into a ${name} managed liquidity position on ${chain} and keep it open through a full fee cycle.`;
+  }
+  if (c.includes('bridge')) {
+    return `Bridge $${capital} of USDC to ${chain} through ${name}, then use the bridged funds in an app on that chain.`;
+  }
+  if (c === 'chain') {
+    // A chain itself: the farm is to arrive on it and use its own apps.
+    return `Bridge $${capital} of USDC to the ${name} chain and use it in one of the chain's own apps, keeping the position open.`;
+  }
+  if (c.includes('payment')) {
+    return `Open a payment channel through ${name} on ${chain} with $${capital} of capacity and keep it open for routing.`;
+  }
+  if (c.includes('otc')) {
+    return `Place $${capital} into an OTC listing through ${name} on ${chain} and keep the listing open until it fills.`;
+  }
+  if (c.includes('card')) {
+    return `Load $${capital} onto a ${name} card on ${chain} and spend it through the card's own app.`;
+  }
+  if (c.includes('governance') || c.includes('incentive')) {
+    return `Deposit $${capital} into ${name} on ${chain} and vote with the position in the next governance round.`;
+  }
+  if (c === 'farm') {
+    return `Deposit $${capital} of USDC into ${name}'s farm on ${chain} and keep the position open through a full reward cycle.`;
+  }
+  if (c.includes('cedefi')) {
+    return `Deposit $${capital} of USDC into ${name}'s vault on ${chain} and hold the vault shares.`;
+  }
+  if (c.includes('anchor') || c.includes('btc')) {
+    return `Deposit $${capital} of BTC through ${name} on ${chain} and hold the receipt it issues.`;
+  }
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
+}
+
+/** Which weekly / hold / check steps a category gets. Steps 3–5 are
+ *  category-aware so a judge opening two drawers does not read the same
+ *  three steps twice — and so no step tells a perps trader to hold a
+ *  leveraged position for 30 days, a prediction-market farmer to borrow,
+ *  or a staker to open a borrow leg. */
+type PlanKind =
+  | 'perps'
+  | 'prediction'
+  | 'rwa'
+  | 'staking'
+  | 'curator'
+  | 'cdp'
+  | 'stable'
+  | 'lending'
+  | 'liquidity'
+  | 'insurance'
+  | 'bridge'
+  | 'generic';
+
+function planKind(p: SnapshotProtocol): PlanKind {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('perpetual') || c.includes('derivative')) return 'perps';
+  if (c.includes('prediction')) return 'prediction';
+  if (c.includes('rwa')) return 'rwa';
+  // Lending before the collateral check: "uncollateralized" contains "collateral".
+  if (c.includes('lend')) return 'lending';
+  if (c.includes('restak') || c.includes('staking') || c.includes('collateral'))
+    return 'staking';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('risk'))
+    return 'curator';
+  if (c.includes('cdp')) return 'cdp';
+  if (c.includes('stable')) return 'stable';
+  if (c.includes('insurance')) return 'insurance';
+  if (c.includes('bridge')) return 'bridge';
+  // Before the dex check: "indexes" contains the substring "dex".
+  if (c.includes('index')) return 'generic';
+  if (
+    c.includes('dex') ||
+    c.includes('yield') ||
+    c.includes('leveraged farm') ||
+    c.includes('liquidity manager') ||
+    c.includes('basis')
+  )
+    return 'liquidity';
+  return 'generic';
+}
+
+/** Steps 3–5 for one plan kind. `hold` is the hold-days figure for kinds
+ *  that hold a position; perps, prediction, RWA, staking and insurance
+ *  close out on their own schedule instead. No step assumes a points page
+ *  exists, and no step promises an airdrop. */
+function planSteps(
+  kind: PlanKind,
+  capital: number,
+  hold: number,
+  gasWeekly: string,
+): { weekly: FarmStep; holdStep: FarmStep; check: FarmStep } {
+  const holdText = `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`;
+  const holdCost = `the $${capital} stays in the position`;
+  const holdTime = `${hold} days`;
+  switch (kind) {
+    case 'perps':
+      return {
+        weekly: {
+          text: `Check funding rates and the hedge once a week, rebalance it only if it has drifted, and record each fill.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          // Agrees with step 2 ("close it the same week"): a leveraged
+          // position is never held for 30 days.
+          text: `Close the hedged position within the same week and record the realised funding and price difference; do not hold a leveraged position for 30 days.`,
+          cost: `the $${capital} margin is released at close-out`,
+          time: 'within the week',
+        },
+        check: {
+          text: `Before you close out, check the funding owed and the final margin on the protocol's own site, and withdraw only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'prediction':
+      return {
+        weekly: {
+          text: `Check open markets once a week, add a small position only to a market whose rules you have read, and record each entry.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Hold each market position until the market resolves, then record the outcome; do not exit early on price moves alone.`,
+          cost: `the $${capital} stays in the position until resolution`,
+          time: 'until the market resolves',
+        },
+        check: {
+          text: `Before a market resolves, check its resolution rules on the protocol's own site so you know what counts as a win.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'rwa':
+      return {
+        weekly: {
+          text: `Check the asset's accrual and maturity date once a week and record the balance; no weekly trade is needed.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Hold the asset until its term or maturity date, then redeem it through the protocol and record the redemption.`,
+          cost: `the $${capital} stays in the position until maturity`,
+          time: 'until maturity',
+        },
+        check: {
+          text: `Before redemption, check the maturity date and any redemption fee on the protocol's own site, and redeem only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'staking':
+      return {
+        weekly: {
+          text: `Check staking rewards once a week and record them; leave the stake and its receipt token untouched.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Keep the stake locked through the protocol's unbonding period and record each reward payout; do not unstake early.`,
+          cost: `the $${capital} stays staked`,
+          time: 'through the unbonding period',
+        },
+        check: {
+          text: `Before you unstake, check the unbonding period and the reward schedule on the protocol's own site.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'curator':
+      return {
+        weekly: {
+          text: `Check the vault's share price and allocation once a week and record it; do not chase vaults week to week.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: { text: holdText, cost: `the $${capital} stays in the vault`, time: holdTime },
+        check: {
+          text: `Before you withdraw, check the vault's share price and withdrawal queue on the protocol's own site, and withdraw only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'cdp':
+      return {
+        weekly: {
+          text: `Check the collateral ratio once a week and top it up if it has slipped toward liquidation; record the ratio.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Keep the minted stablecoin position open for at least ${hold} days, keeping the collateral ratio above the liquidation line.`,
+          cost: `the $${capital} of collateral stays locked`,
+          time: holdTime,
+        },
+        check: {
+          text: `Before you repay, check the collateral ratio and any mint fee on the protocol's own site, and repay only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'stable':
+      return {
+        weekly: {
+          text: `Check the stable asset's peg once a week and record the balance; no weekly trade is needed.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: { text: holdText, cost: holdCost, time: holdTime },
+        check: {
+          text: `Before you redeem, check the redemption route and any fee on the protocol's own site, and redeem only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'lending':
+      return {
+        weekly: {
+          text: `Check borrow rates and the health factor once a week, and rebalance only if the health factor has slipped; keep the receipts.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: { text: holdText, cost: holdCost, time: holdTime },
+        check: {
+          text: `Before you withdraw, check the borrow balance and the health factor on the protocol's own site, and repay first if anything is still borrowed.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'insurance':
+      return {
+        weekly: {
+          text: `Check the cover status once a week and record it; no weekly action is needed while the policy runs.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Keep the policy until it lapses or the cover period ends, then record the outcome.`,
+          cost: `the $${capital} stays in cover`,
+          time: 'until the policy lapses',
+        },
+        check: {
+          text: `Before the policy lapses, check the claim terms on the protocol's own site so you know what is covered.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'bridge':
+      return {
+        weekly: {
+          text: `Check the bridged funds once a week and record where they are working on the destination chain.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: {
+          text: `Keep the bridged funds working on the destination chain for at least ${hold} days.`,
+          cost: holdCost,
+          time: holdTime,
+        },
+        check: {
+          text: `Before you bridge back, check the return route and fee on the protocol's own site, and bridge only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'liquidity':
+      return {
+        weekly: {
+          text: `Check the fees earned once a week and record them; add liquidity only if the pool is still the protocol's main one.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: { text: holdText, cost: holdCost, time: holdTime },
+        check: {
+          text: `Before you withdraw, check the position and any earned fees on the protocol's own site, and withdraw only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+    case 'generic':
+    default:
+      return {
+        weekly: {
+          text: `Make one qualifying action each week, such as a deposit or a swap, and keep the receipts.`,
+          cost: `about ${gasWeekly} of gas a week`,
+          time: '10 minutes a week',
+        },
+        holdStep: { text: holdText, cost: holdCost, time: holdTime },
+        check: {
+          text: `Before you withdraw, check the position and any withdrawal queue on the protocol's own site, and withdraw only through the link it publishes.`,
+          cost: 'no fee to check, and never pay to claim',
+          time: '10 minutes',
+        },
+      };
+  }
 }
 
 /**
@@ -517,12 +1017,16 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list
  * of names, and it never promises an airdrop: it says what to do so the activity is on record
  * if the protocol ever rewards it, and what to check before paying anything.
+ * Steps 1 (fresh wallet) and 6 (farm log) are the same for every row; steps 2–5 are
+ * category- and chain-aware (see actionFor, planSteps and gasFor).
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
   const action = actionFor(p, capital, chain);
+  const gas = gasFor(chain);
+  const { weekly, holdStep, check } = planSteps(planKind(p), capital, hold, gas.weekly);
   const multi = p.chains.length > 1
     ? ` Repeat the deposit on a second chain ${p.name} supports, ${p.chains[1]}, so the activity is visible there too.`
     : '';
@@ -534,24 +1038,12 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
     },
     {
       text: `${action}${multi}`,
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about ${gas.setup} of gas`,
       time: '15 minutes to set up',
     },
-    {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote, and keep the receipts.`,
-      cost: 'about $2 of gas a week',
-      time: '10 minutes a week',
-    },
-    {
-      text: `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot.`,
-      cost: `the $${capital} stays in the position`,
-      time: `${hold} days`,
-    },
-    {
-      text: `Before you withdraw, open the protocol's own points or rewards page from its official site and claim only from the link it publishes.`,
-      cost: 'no fee to check, and never pay to claim',
-      time: '10 minutes',
-    },
+    weekly,
+    holdStep,
+    check,
     {
       text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`,
       cost: 'nothing but the log',
@@ -596,6 +1088,9 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
     watchlist: row.watchlist,
+    multiple_n: row.model.multiple_n,
+    multiple_note: row.model.multiple_note,
+    record_flag: row.record_flag,
   };
 }
 
@@ -605,12 +1100,17 @@ export function buildRadar(
   model: ModelConstants = MODEL,
 ): { board: BoardRow[]; radar: RadarData } {
   const multiples = categoryMultiples(snapshot.protocols, model);
+  const { byCategory: detail } = calibrationByCategory(snapshot.protocols, model);
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !r.watchlist).length;
   const multiplesRecord: Record<string, number> = {};
   for (const [key, value] of [...multiples.byCategory.entries()].sort()) {
     multiplesRecord[key] = round4(value);
+  }
+  const liveByCategory: Record<string, CategoryCalibration> = {};
+  for (const key of [...detail.keys()].sort()) {
+    liveByCategory[key] = detail.get(key)!;
   }
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -626,6 +1126,7 @@ export function buildRadar(
     live_size: live.length,
     rows: board.map(radarRow),
     live,
+    liveByCategory,
   };
   return { board, radar };
 }

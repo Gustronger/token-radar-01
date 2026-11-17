@@ -1,7 +1,7 @@
 // Token Radar's entry point (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
-// scores every pre-token protocol with the radar-2 model in lib/model.ts, writes
+// scores every pre-token protocol with the radar-3 model in lib/model.ts, writes
 // the ranked board to /output/board.json and the dashboard's dataset to
 // /output/data.js, copies this repository's dashboard/ and screenshots/ to /output,
 // and writes /output/dossier.json last, the summary the judge reads, with the
@@ -19,6 +19,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSyn
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import type { BoardRow } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -94,9 +95,16 @@ function multiplesLine(): string {
   return `token radar: multiples overall ${radar.overall_multiple.toFixed(3)}x; top categories ${top}`;
 }
 
+/** The record-check flags in one line: which rows the snapshot records as pre-token but whose token is known to trade. The flag is disclosure only — flagged rows keep the value the model computes. */
+function flaggedLine(board: BoardRow[]): string {
+  const flagged = board.filter((r) => r.record_flag !== null).map((r) => r.slug);
+  return `token radar: ${flagged.length} row${flagged.length === 1 ? '' : 's'} flagged token-live-despite-the-record: ${flagged.join(', ')} (values unchanged; see record_flag)`;
+}
+
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
     `${multiplesLine()}\n` +
     `token radar: top row ${board[0]!.slug} at $${board[0]!.implied_value_usd.toLocaleString('en-US')}\n` +
+    `${flaggedLine(board)}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
