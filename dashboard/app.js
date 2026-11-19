@@ -1,10 +1,8 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside dashboard/
-// by main.ts) and renders the ranked board, a filterable table, a per-protocol detail
-// drawer with the model's own inputs, its live comparables and the protocol's farm plan.
-// No network: every byte it shows is in data.js.
+// Token Radar dashboard, radar-4. Reads window.RADAR (written beside dashboard/
+// by main.ts) and renders the ranked board, filters, and a per-protocol detail
+// drawer with the model's inputs, live comparables and farm plan. No network.
 (function () {
   'use strict';
-
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
@@ -31,26 +29,20 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return n.toFixed(3) + 'x';
   }
-
-  function rawRatio(r) {
-    return r.mcap_usd && r.tvl_usd ? r.mcap_usd / r.tvl_usd : null;
-  }
-  function winsorRatio(r) {
+  function rawR(r) { return r.mcap_usd && r.tvl_usd ? r.mcap_usd / r.tvl_usd : null; }
+  function winR(r) {
     if (r === null || r === undefined || !isFinite(r)) return null;
     return Math.min(DATA.model.ratio_cap, Math.max(DATA.model.ratio_floor, r));
   }
-  function medianOf(sorted) {
-    var n = sorted.length;
+  function median(s) {
+    var n = s.length;
     if (n === 0) return null;
-    var mid = Math.floor(n / 2);
-    return n % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    var m = Math.floor(n / 2);
+    return n % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
   }
-  // Whether a row's multiple is the overall median, not a category
-  // calibration. With multiple_n: n = 0 is a fallback, n >= 3 never is,
-  // n = 1-2 only while the multiple still equals the overall median.
-  // Without it, the multiples table marks it the same way; a category
-  // with no live comps at all is not in the table, and is a fallback too.
-  function isFallbackMultiple(row) {
+  // A row's multiple is the overall median, not a category calibration, when
+  // n = 0; n >= 3 never is; n = 1-2 only while it still equals the overall.
+  function isFallback(row) {
     var m = DATA.multiples ? DATA.multiples[row.category || ''] : undefined;
     if (typeof row.multiple_n === 'number') {
       if (row.multiple_n === 0) return true;
@@ -59,16 +51,13 @@
     }
     return m === undefined || m === DATA.overall_multiple;
   }
-  // Short label for a record-check flag: the kind is a machine token.
   function flagLabel(flag) {
     if (!flag) return '';
     if (flag.kind === 'token-trades') return 'token already trades';
     return flag.kind || 'record check';
   }
-
-  // The model in one function: the page recomputes a row from the snapshot figures and checks the
-  // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
-  // radar-3: TVL x category multiple x growth x maturity x chain diversity.
+  // The model in one function: the page recomputes a row from the snapshot
+  // figures and checks the number board.json carries.
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthMult = 1 + (growth / 100) * model.growth_weight;
@@ -78,7 +67,6 @@
     var multiple = row.category_multiple === undefined ? DATA.overall_multiple : row.category_multiple;
     return Math.max(1, Math.round(row.tvl_usd * multiple * growthMult * maturity * chains));
   }
-
   function el(tag, attrs) {
     var node = document.createElement(tag);
     if (attrs) {
@@ -100,59 +88,61 @@
     return node;
   }
 
-  // The farm plan is the same derivation main.ts writes to board.json: category, chains, TVL and age
-  // decide the action, the capital, the hold and every cost and time. No name is special-cased.
-  // This copy must match lib/model.ts step for step, so the drawer shows the plan the board carries.
-  // radar-3: steps 3-5 are category-aware (see planKind/planSteps) and gas is chain-aware (gasFor).
-  function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
-  function capitalFor(p) {
-    if (p.tvl_usd >= 5e9) return 250;
-    if (p.tvl_usd >= 1e9) return 150;
-    if (p.tvl_usd >= 1e8) return 100;
-    return 50;
-  }
-  function holdDaysFor(age) {
-    if (age === null || age === undefined) return 30;
-    if (age < 180) return 60;
-    if (age < 365) return 45;
-    return 30;
-  }
-  function gasFor(chain) {
-    if (chain === 'Ethereum') return { setup: '$5', weekly: '$3' };
-    if (chain === 'Tron') return { setup: '$2', weekly: '$1' };
-    if (chain === 'Bitcoin') return { setup: '$2', weekly: '$1' };
-    if (chain === 'Solana') return { setup: '$0.01', weekly: '$0.01' };
-    if (chain === 'Binance') return { setup: '$0.30', weekly: '$0.20' };
-    return { setup: '$0.10', weekly: '$0.10' };
-  }
-  function actionFor(p, capital, chain) {
+  // Farm plan: the same derivation main.ts writes to board.json — category,
+  // chains, TVL and age decide the action, capital, hold and every cost.
+  // Must match lib/model.ts step for step. $CH = chain, $C = $capital, $N = name.
+  var ACT = [
+    ['cdp', 'Deposit $C of collateral through $N on $CH, mint the stablecoin it issues against that collateral, and hold the minted coins.'],
+    ['lend', 'Supply $C of USDC to $N on $CH, borrow a small amount against it, and keep both legs open.'],
+    ['collateral', 'Deposit $C of collateral assets through $N on $CH to secure the networks it covers, and keep the deposit staked.'],
+    ['restak|staking', "Stake $C of the chain's staking asset through $N and keep the receipt token in your wallet."],
+    ['perpetual|derivative', 'Deposit $C of USDC as margin on $N, open one small hedged position, and close it the same week.'],
+    ['prediction', 'Fund $C on $N and place one small market position on an outcome you have read.'],
+    ['curator|allocator|risk', 'Deposit $C into a $N vault on $CH and hold the vault shares.'],
+    ['stable', 'Mint or deposit $C of the stable asset through $N on $CH and hold it.'],
+    ['rwa', "Mint $C of the protocol's yield asset on $CH and hold it for the full term."],
+    ['insurance', 'Buy $C of cover from $N on $CH and keep the policy until it lapses.'],
+    ['basis|yield aggregator', "Deposit $C into $N's main strategy on $CH and leave it running."],
+    ['index', 'Buy $C of the $N index token on $CH and hold it through one rebalance.'],
+    ['dex|yield|leveraged farm', "Provide $C of liquidity to $N's main pool on $CH and keep the position open through a full fee cycle."],
+    ['liquidity manager', 'Deposit $C of USDC into a $N managed liquidity position on $CH and keep it open through a full fee cycle.'],
+    ['bridge', 'Bridge $C of USDC to $CH through $N, then use the bridged funds in an app on that chain.'],
+    ['=chain', "Bridge $C of USDC to the $N chain and use it in one of the chain's own apps, keeping the position open."],
+    ['payment', 'Open a payment channel through $N on $CH with $C of capacity and keep it open for routing.'],
+    ['otc', 'Place $C into an OTC listing through $N on $CH and keep the listing open until it fills.'],
+    ['card', "Load $C onto a $N card on $CH and spend it through the card's own app."],
+    ['governance|incentive', 'Deposit $C into $N on $CH and vote with the position in the next governance round.'],
+    ['=farm', "Deposit $C of USDC into $N's farm on $CH and keep the position open through a full reward cycle."],
+    ['cedefi', "Deposit $C of USDC into $N's vault on $CH and hold the vault shares."],
+    ['anchor|btc', 'Deposit $C of BTC through $N on $CH and hold the receipt it issues.']
+  ];
+  function action(p, cap, ch) {
     var c = (p.category || '').toLowerCase();
-    var name = p.name;
-    if (c.indexOf('cdp') >= 0) return 'Deposit $' + capital + ' of collateral through ' + name + ' on ' + chain + ', mint the stablecoin it issues against that collateral, and hold the minted coins.';
-    if (c.indexOf('lend') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ', borrow a small amount against it, and keep both legs open.';
-    if (c.indexOf('collateral') >= 0) return 'Deposit $' + capital + ' of collateral assets through ' + name + ' on ' + chain + ' to secure the networks it covers, and keep the deposit staked.';
-    if (c.indexOf('restak') >= 0 || c.indexOf('staking') >= 0) return "Stake $" + capital + " of the chain's staking asset through " + name + ' and keep the receipt token in your wallet.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ', open one small hedged position, and close it the same week.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' on ' + name + ' and place one small market position on an outcome you have read.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0 || c.indexOf('risk') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and hold the vault shares.';
-    if (c.indexOf('stable') >= 0) return 'Mint or deposit $' + capital + ' of the stable asset through ' + name + ' on ' + chain + ' and hold it.';
-    if (c.indexOf('rwa') >= 0) return "Mint $" + capital + " of the protocol's yield asset on " + chain + ' and hold it for the full term.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' and keep the policy until it lapses.';
-    if (c.indexOf('basis') >= 0 || c.indexOf('yield aggregator') >= 0) return 'Deposit $' + capital + " into " + name + "'s main strategy on " + chain + ' and leave it running.';
-    if (c.indexOf('index') >= 0) return 'Buy $' + capital + ' of the ' + name + ' index token on ' + chain + ' and hold it through one rebalance.';
-    if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + "'s main pool on " + chain + ' and keep the position open through a full fee cycle.';
-    if (c.indexOf('liquidity manager') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed liquidity position on ' + chain + ' and keep it open through a full fee cycle.';
-    if (c.indexOf('bridge') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' through ' + name + ', then use the bridged funds in an app on that chain.';
-    if (c === 'chain') return 'Bridge $' + capital + ' of USDC to the ' + name + " chain and use it in one of the chain's own apps, keeping the position open.";
-    if (c.indexOf('payment') >= 0) return 'Open a payment channel through ' + name + ' on ' + chain + ' with $' + capital + ' of capacity and keep it open for routing.';
-    if (c.indexOf('otc') >= 0) return 'Place $' + capital + ' into an OTC listing through ' + name + ' on ' + chain + ' and keep the listing open until it fills.';
-    if (c.indexOf('card') >= 0) return 'Load $' + capital + ' onto a ' + name + ' card on ' + chain + " and spend it through the card's own app.";
-    if (c.indexOf('governance') >= 0 || c.indexOf('incentive') >= 0) return 'Deposit $' + capital + ' into ' + name + ' on ' + chain + ' and vote with the position in the next governance round.';
-    if (c === 'farm') return 'Deposit $' + capital + " of USDC into " + name + "'s farm on " + chain + ' and keep the position open through a full reward cycle.';
-    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + " of USDC into " + name + "'s vault on " + chain + ' and hold the vault shares.';
-    if (c.indexOf('anchor') >= 0 || c.indexOf('btc') >= 0) return 'Deposit $' + capital + ' of BTC through ' + name + ' on ' + chain + ' and hold the receipt it issues.';
-    return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
+    for (var i = 0; i < ACT.length; i++) {
+      var k = ACT[i][0], hit = false;
+      if (k.charAt(0) === '=') hit = c === k.slice(1);
+      else { var parts = k.split('|'); for (var j = 0; j < parts.length; j++) if (c.indexOf(parts[j]) >= 0) { hit = true; break; } }
+      if (hit) return ACT[i][1].split('$CH').join(ch).split('$C').join('$' + cap).split('$N').join(p.name);
+    }
+    return 'Deposit $' + cap + ' of USDC into ' + p.name + ' on ' + ch + ' and keep the position open.';
   }
+  // Steps 3-5 by plan kind: [weekly, hold, hold-cost code, hold-time code, check].
+  // HOLD in a hold text is the hold in days. Costs/times shared by every kind
+  // are built once in planParts below.
+  var PLANS = {
+    perps: ['Check funding rates and the hedge once a week, rebalance it only if it has drifted, and record each fill.', 'Close the hedged position within the same week and record the realised funding and price difference; do not hold a leveraged position for 30 days.', 'margin', 'week', "Before you close out, check the funding owed and the final margin on the protocol's own site, and withdraw only through the link it publishes."],
+    prediction: ['Check open markets once a week, add a small position only to a market whose rules you have read, and record each entry.', 'Hold each market position until the market resolves, then record the outcome; do not exit early on price moves alone.', 'res', 'res', "Before a market resolves, check its resolution rules on the protocol's own site so you know what counts as a win."],
+    rwa: ["Check the asset's accrual and maturity date once a week and record the balance; no weekly trade is needed.", 'Hold the asset until its term or maturity date, then redeem it through the protocol and record the redemption.', 'mat', 'mat', "Before redemption, check the maturity date and any redemption fee on the protocol's own site, and redeem only through the link it publishes."],
+    staking: ['Check staking rewards once a week and record them; leave the stake and its receipt token untouched.', "Keep the stake locked through the protocol's unbonding period and record each reward payout; do not unstake early.", 'stake', 'unbond', "Before you unstake, check the unbonding period and the reward schedule on the protocol's own site."],
+    curator: ["Check the vault's share price and allocation once a week and record it; do not chase vaults week to week.", 'Hold the position for at least HOLD days so the activity is counted in more than one snapshot.', 'vault', 'hold', "Before you withdraw, check the vault's share price and withdrawal queue on the protocol's own site, and withdraw only through the link it publishes."],
+    cdp: ['Check the collateral ratio once a week and top it up if it has slipped toward liquidation; record the ratio.', 'Keep the minted stablecoin position open for at least HOLD days, keeping the collateral ratio above the liquidation line.', 'collat', 'hold', "Before you repay, check the collateral ratio and any mint fee on the protocol's own site, and repay only through the link it publishes."],
+    stable: ["Check the stable asset's peg once a week and record the balance; no weekly trade is needed.", 'Hold the position for at least HOLD days so the activity is counted in more than one snapshot.', 'pos', 'hold', "Before you redeem, check the redemption route and any fee on the protocol's own site, and redeem only through the link it publishes."],
+    lending: ['Check borrow rates and the health factor once a week, and rebalance only if the health factor has slipped; keep the receipts.', 'Hold the position for at least HOLD days so the activity is counted in more than one snapshot.', 'pos', 'hold', "Before you withdraw, check the borrow balance and the health factor on the protocol's own site, and repay first if anything is still borrowed."],
+    insurance: ['Check the cover status once a week and record it; no weekly action is needed while the policy runs.', 'Keep the policy until it lapses or the cover period ends, then record the outcome.', 'cover', 'lapse', "Before the policy lapses, check the claim terms on the protocol's own site so you know what is covered."],
+    bridge: ['Check the bridged funds once a week and record where they are working on the destination chain.', 'Keep the bridged funds working on the destination chain for at least HOLD days.', 'pos', 'hold', "Before you bridge back, check the return route and fee on the protocol's own site, and bridge only through the link it publishes."],
+    liquidity: ["Check the fees earned once a week and record them; add liquidity only if the pool is still the protocol's main one.", 'Hold the position for at least HOLD days so the activity is counted in more than one snapshot.', 'pos', 'hold', "Before you withdraw, check the position and any earned fees on the protocol's own site, and withdraw only through the link it publishes."],
+    generic: ['Make one qualifying action each week, such as a deposit or a swap, and keep the receipts.', 'Hold the position for at least HOLD days so the activity is counted in more than one snapshot.', 'pos', 'hold', "Before you withdraw, check the position and any withdrawal queue on the protocol's own site, and withdraw only through the link it publishes."]
+  };
   function planKind(p) {
     var c = (p.category || '').toLowerCase();
     if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'perps';
@@ -169,72 +159,36 @@
     if (c.indexOf('dex') >= 0 || c.indexOf('yield') >= 0 || c.indexOf('leveraged farm') >= 0 || c.indexOf('liquidity manager') >= 0 || c.indexOf('basis') >= 0) return 'liquidity';
     return 'generic';
   }
-  function planSteps(kind, capital, hold, gasWeekly) {
-    var holdText = 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.';
-    var holdCost = 'the $' + capital + ' stays in the position';
-    var holdTime = hold + ' days';
-    var weeklyCost = 'about ' + gasWeekly + ' of gas a week';
-    var noFee = 'no fee to check, and never pay to claim';
-    if (kind === 'perps') return {
-      weekly: { text: 'Check funding rates and the hedge once a week, rebalance it only if it has drifted, and record each fill.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Close the hedged position within the same week and record the realised funding and price difference; do not hold a leveraged position for 30 days.', cost: 'the $' + capital + ' margin is released at close-out', time: 'within the week' },
-      check: { text: "Before you close out, check the funding owed and the final margin on the protocol's own site, and withdraw only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'prediction') return {
-      weekly: { text: 'Check open markets once a week, add a small position only to a market whose rules you have read, and record each entry.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Hold each market position until the market resolves, then record the outcome; do not exit early on price moves alone.', cost: 'the $' + capital + ' stays in the position until resolution', time: 'until the market resolves' },
-      check: { text: "Before a market resolves, check its resolution rules on the protocol's own site so you know what counts as a win.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'rwa') return {
-      weekly: { text: "Check the asset's accrual and maturity date once a week and record the balance; no weekly trade is needed.", cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Hold the asset until its term or maturity date, then redeem it through the protocol and record the redemption.', cost: 'the $' + capital + ' stays in the position until maturity', time: 'until maturity' },
-      check: { text: "Before redemption, check the maturity date and any redemption fee on the protocol's own site, and redeem only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'staking') return {
-      weekly: { text: 'Check staking rewards once a week and record them; leave the stake and its receipt token untouched.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: "Keep the stake locked through the protocol's unbonding period and record each reward payout; do not unstake early.", cost: 'the $' + capital + ' stays staked', time: 'through the unbonding period' },
-      check: { text: "Before you unstake, check the unbonding period and the reward schedule on the protocol's own site.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'curator') return {
-      weekly: { text: "Check the vault's share price and allocation once a week and record it; do not chase vaults week to week.", cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: holdText, cost: 'the $' + capital + ' stays in the vault', time: holdTime },
-      check: { text: "Before you withdraw, check the vault's share price and withdrawal queue on the protocol's own site, and withdraw only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'cdp') return {
-      weekly: { text: 'Check the collateral ratio once a week and top it up if it has slipped toward liquidation; record the ratio.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Keep the minted stablecoin position open for at least ' + hold + ' days, keeping the collateral ratio above the liquidation line.', cost: 'the $' + capital + ' of collateral stays locked', time: holdTime },
-      check: { text: "Before you repay, check the collateral ratio and any mint fee on the protocol's own site, and repay only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'stable') return {
-      weekly: { text: "Check the stable asset's peg once a week and record the balance; no weekly trade is needed.", cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: holdText, cost: holdCost, time: holdTime },
-      check: { text: "Before you redeem, check the redemption route and any fee on the protocol's own site, and redeem only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'lending') return {
-      weekly: { text: 'Check borrow rates and the health factor once a week, and rebalance only if the health factor has slipped; keep the receipts.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: holdText, cost: holdCost, time: holdTime },
-      check: { text: "Before you withdraw, check the borrow balance and the health factor on the protocol's own site, and repay first if anything is still borrowed.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'insurance') return {
-      weekly: { text: 'Check the cover status once a week and record it; no weekly action is needed while the policy runs.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Keep the policy until it lapses or the cover period ends, then record the outcome.', cost: 'the $' + capital + ' stays in cover', time: 'until the policy lapses' },
-      check: { text: "Before the policy lapses, check the claim terms on the protocol's own site so you know what is covered.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'bridge') return {
-      weekly: { text: 'Check the bridged funds once a week and record where they are working on the destination chain.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: 'Keep the bridged funds working on the destination chain for at least ' + hold + ' days.', cost: holdCost, time: holdTime },
-      check: { text: "Before you bridge back, check the return route and fee on the protocol's own site, and bridge only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
-    if (kind === 'liquidity') return {
-      weekly: { text: "Check the fees earned once a week and record them; add liquidity only if the pool is still the protocol's main one.", cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: holdText, cost: holdCost, time: holdTime },
-      check: { text: "Before you withdraw, check the position and any earned fees on the protocol's own site, and withdraw only through the link it publishes.", cost: noFee, time: '10 minutes' }
-    };
+  function planParts(kind, cap, hold, gasW) {
+    var hc = { pos: 'the $' + cap + ' stays in the position', margin: 'the $' + cap + ' margin is released at close-out', res: 'the $' + cap + ' stays in the position until resolution', mat: 'the $' + cap + ' stays in the position until maturity', stake: 'the $' + cap + ' stays staked', vault: 'the $' + cap + ' stays in the vault', collat: 'the $' + cap + ' of collateral stays locked', cover: 'the $' + cap + ' stays in cover' };
+    var ht = { hold: hold + ' days', week: 'within the week', res: 'until the market resolves', mat: 'until maturity', unbond: 'through the unbonding period', lapse: 'until the policy lapses' };
+    var p = PLANS[kind] || PLANS.generic;
     return {
-      weekly: { text: 'Make one qualifying action each week, such as a deposit or a swap, and keep the receipts.', cost: weeklyCost, time: '10 minutes a week' },
-      holdStep: { text: holdText, cost: holdCost, time: holdTime },
-      check: { text: "Before you withdraw, check the position and any withdrawal queue on the protocol's own site, and withdraw only through the link it publishes.", cost: noFee, time: '10 minutes' }
+      weekly: { text: p[0], cost: 'about ' + gasW + ' of gas a week', time: '10 minutes a week' },
+      holdStep: { text: p[1].split('HOLD').join(String(hold)), cost: hc[p[2]], time: ht[p[3]] },
+      check: { text: p[4], cost: 'no fee to check, and never pay to claim', time: '10 minutes' }
     };
+  }
+  function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
+  function capFor(p) {
+    if (p.tvl_usd >= 5e9) return 250;
+    if (p.tvl_usd >= 1e9) return 150;
+    if (p.tvl_usd >= 1e8) return 100;
+    return 50;
+  }
+  function holdFor(age) {
+    if (age === null || age === undefined) return 30;
+    if (age < 180) return 60;
+    if (age < 365) return 45;
+    return 30;
+  }
+  function gasFor(chain) {
+    if (chain === 'Ethereum') return { setup: '$5', weekly: '$3' };
+    if (chain === 'Tron') return { setup: '$2', weekly: '$1' };
+    if (chain === 'Bitcoin') return { setup: '$2', weekly: '$1' };
+    if (chain === 'Solana') return { setup: '$0.01', weekly: '$0.01' };
+    if (chain === 'Binance') return { setup: '$0.30', weekly: '$0.20' };
+    return { setup: '$0.10', weekly: '$0.10' };
   }
   function stepText(step) {
     var s = step.text + ' Cost: ' + step.cost + '. Time: ' + step.time + '.';
@@ -242,18 +196,18 @@
     if (s.length < 20) s = s + " Hold the position and check the protocol's own page.";
     return s;
   }
-  function farmSteps(p) {
+  function farm(p) {
     var chain = chainOf(p);
-    var capital = capitalFor(p);
-    var hold = holdDaysFor(p.age_days);
+    var cap = capFor(p);
+    var hold = holdFor(p.age_days);
     var gas = gasFor(chain);
-    var plan = planSteps(planKind(p), capital, hold, gas.weekly);
+    var plan = planParts(planKind(p), cap, hold, gas.weekly);
     var multi = p.chains && p.chains.length > 1
       ? ' Repeat the deposit on a second chain ' + p.name + ' supports, ' + p.chains[1] + ', so the activity is visible there too.'
       : '';
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain) + multi, cost: '$' + capital + ' of capital and about ' + gas.setup + ' of gas', time: '15 minutes to set up' },
+      { text: action(p, cap, chain) + multi, cost: '$' + cap + ' of capital and about ' + gas.setup + ' of gas', time: '15 minutes to set up' },
       plan.weekly,
       plan.holdStep,
       plan.check,
@@ -322,7 +276,6 @@
       )
     );
   }
-
   function lede() {
     return el('section', { class: 'lede' },
       el('div', null,
@@ -337,7 +290,6 @@
       )
     );
   }
-
   function controls() {
     var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
     var chains = Array.from(new Set(DATA.rows.reduce(function (acc, r) { return acc.concat(r.chains || []); }, []))).sort();
@@ -370,7 +322,6 @@
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : liveRows().length + ' of ' + DATA.live.length + ' live-token protocols' })
     );
   }
-
   // Active-filter chips: the filtered state as a glanceable fact, not just
   // a select value. Each chip clears its own filter; Clear resets all.
   function chipRow() {
@@ -390,8 +341,7 @@
     row.appendChild(el('button', { class: 'chip clear', type: 'button', text: 'Clear', onclick: function () { state.q = ''; state.category = 'all'; state.chain = 'all'; state.scope = 'all'; writeHash(); render(); } }));
     return row;
   }
-
-  function sortHeader(key, label) {
+  function thSort(key, label) {
     return el('th', { scope: 'col' },
       el('button', { type: 'button', onclick: function () { if (state.sort === key) state.dir = -state.dir; else { state.sort = key; state.dir = (key === 'rank' || key === 'name') ? 1 : -1; } render(); } },
         label,
@@ -418,9 +368,9 @@
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
       var flag = r.record_flag;
       var tokenBadge = flag
-        ? ' · \u26a0 ' + flagLabel(flag) + ' \u2014 see detail'
-        : ' · no token on record';
-      var fallback = isFallbackMultiple(r);
+        ? ' \u00b7 \u26a0 ' + flagLabel(flag) + ' \u2014 see detail'
+        : ' \u00b7 no token on record';
+      var fallback = isFallback(r);
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
@@ -430,7 +380,8 @@
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') + (r.watchlist ? ' · watchlist' : ' · early') + tokenBadge })
+          el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') + tokenBadge }),
+          el('span', { class: r.watchlist ? 'tag wl' : 'tag', text: r.watchlist ? 'Watchlist' : 'Early' })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
@@ -448,20 +399,19 @@
         el('table', null,
           el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its model, comparables and farm plan.' }),
           el('thead', null, el('tr', null,
-            sortHeader('rank', 'Rank'),
-            sortHeader('name', 'Protocol'),
-            sortHeader('tvl', 'TVL'),
-            sortHeader('growth', '7d'),
-            sortHeader('age', 'Age'),
-            sortHeader('multiple', 'Multiple'),
-            sortHeader('implied', 'Implied value')
+            thSort('rank', 'Rank'),
+            thSort('name', 'Protocol'),
+            thSort('tvl', 'TVL'),
+            thSort('growth', '7d'),
+            thSort('age', 'Age'),
+            thSort('multiple', 'Multiple'),
+            thSort('implied', 'Implied value')
           )),
           tbody
         )
       )
     );
-    if (list.some(isFallbackMultiple)) {
-      // radar-3 marks only n=0 rows as fallbacks; older data marked n<3.
+    if (list.some(isFallback)) {
       var footnote = DATA.rows.some(function (r) { return typeof r.multiple_n === 'number'; })
         ? '* overall median \u2014 no live comps in this category'
         : '* overall median \u2014 fewer than 3 live comps in this category';
@@ -490,7 +440,7 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'ratio') {
-        av = winsorRatio(rawRatio(a)); bv = winsorRatio(rawRatio(b));
+        av = winR(rawR(a)); bv = winR(rawR(b));
         av = av === null ? -Infinity : av; bv = bv === null ? -Infinity : bv;
       }
       else { av = a.mcap_usd === null ? -Infinity : a.mcap_usd; bv = b.mcap_usd === null ? -Infinity : b.mcap_usd; }
@@ -499,7 +449,7 @@
       return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
     });
   }
-  function liveSortHeader(key, label) {
+  function thLive(key, label) {
     return el('th', { scope: 'col' },
       el('button', { type: 'button', onclick: function () { if (state.liveSort === key) state.liveDir = -state.liveDir; else { state.liveSort = key; state.liveDir = key === 'name' ? 1 : -1; } render(); } },
         label,
@@ -507,7 +457,6 @@
       )
     );
   }
-
   function liveTable() {
     var list = sortedLive(liveRows());
     if (list.length === 0) {
@@ -521,14 +470,14 @@
     var anyCapped = false;
     var anyFloored = false;
     list.forEach(function (r) {
-      var raw = rawRatio(r);
-      var w = winsorRatio(raw);
+      var raw = rawR(r);
+      var w = winR(raw);
       var capped = raw !== null && raw > DATA.model.ratio_cap;
       var floored = raw !== null && raw < DATA.model.ratio_floor;
       if (capped) anyCapped = true;
       if (floored) anyFloored = true;
       tbody.appendChild(el('tr', { 'data-static': 'true' },
-        el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') + ' · already trades' }))),
+        el('td', null, el('div', { class: 'name' }, el('b', { text: r.name }), el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') + ' \u00b7 already trades' }))),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + (r.change_7d !== null && r.change_7d >= 0 ? 'pos' : 'neg'), text: fmtPct(r.change_7d) }),
         el('td', { class: 'num', text: fmtUsd(r.mcap_usd) }),
@@ -543,11 +492,11 @@
         el('table', null,
           el('caption', { class: 'sub', text: 'The ' + DATA.live.length + ' largest live-token protocols; the multiples use all 119. Market caps are facts, not a model — these protocols already trade, so they are set aside from the pre-token ranking.' }),
           el('thead', null, el('tr', null,
-            liveSortHeader('name', 'Protocol'),
-            liveSortHeader('tvl', 'TVL'),
-            liveSortHeader('growth', '7d'),
-            liveSortHeader('mcap', 'Market cap'),
-            liveSortHeader('ratio', 'Mcap / TVL')
+            thLive('name', 'Protocol'),
+            thLive('tvl', 'TVL'),
+            thLive('growth', '7d'),
+            thLive('mcap', 'Market cap'),
+            thLive('ratio', 'Mcap / TVL')
           )),
           tbody
         )
@@ -561,7 +510,7 @@
     return panel;
   }
 
-  function multiplesTable() {
+  function multTable() {
     var entries = Object.keys(DATA.multiples || {}).map(function (k) { return [k, DATA.multiples[k]]; });
     entries.sort(function (a, b) { return b[1] - a[1]; });
     var fallbackCount = entries.filter(function (e) { return e[1] === DATA.overall_multiple; }).length;
@@ -597,12 +546,8 @@
       )
     );
   }
-
   function modelPanel() {
     var m = DATA.model;
-    // radar-3 shrinks at every comp count; the old hard fallback (fewer
-    // than 3 live comps take the overall median outright) is stated only
-    // for data that still carries it (no multiple_n on rows).
     var graded = DATA.rows.some(function (r) { return typeof r.multiple_n === 'number'; });
     var multipleRule = graded
       ? 'shrunk toward the overall median of ' + DATA.overall_multiple + 'x with a prior of ' + m.shrink_prior + ' at every comp count: multiple = (n \u00d7 median + ' + m.shrink_prior + ' \u00d7 overall) / (n + ' + m.shrink_prior + '); a category with no live comps at all takes the overall median.'
@@ -624,11 +569,9 @@
   // category: n, medians, multiple, comps capped at 5 by market cap) the
   // drawer shows that real set. Without it, the page only ships the 24
   // largest live-token protocols, so the drawer says so and never claims
-  // their median is the row's multiple. The basis line uses the row's own
-  // multiple_note when data.js carries it, so it cannot disagree with the
-  // equation box above it.
+  // their median is the row's multiple.
   function comparables(row) {
-    var fallback = isFallbackMultiple(row);
+    var fallback = isFallback(row);
     var n = typeof row.multiple_n === 'number' ? row.multiple_n : null;
     var note = typeof row.multiple_note === 'string' && row.multiple_note ? row.multiple_note : null;
     var cat = DATA.liveByCategory && DATA.liveByCategory[row.category || ''];
@@ -651,13 +594,13 @@
     }
     if (comps === null) {
       comps = DATA.live.filter(function (r) { return r.category === row.category; }).map(function (r) {
-        var raw = rawRatio(r);
-        return { name: r.name, mcap_usd: r.mcap_usd, tvl_usd: r.tvl_usd, ratio_w: winsorRatio(raw), ratio_raw: raw };
+        var raw = rawR(r);
+        return { name: r.name, mcap_usd: r.mcap_usd, tvl_usd: r.tvl_usd, ratio_w: winR(raw), ratio_raw: raw };
       });
     }
-    var median = catMedian;
-    if (median === null && catN !== null && comps.length >= catN && comps.length > 0) {
-      median = medianOf(comps.map(function (c) { return c.ratio_w; }).sort(function (a, b) { return a - b; }));
+    var med = catMedian;
+    if (med === null && catN !== null && comps.length >= catN && comps.length > 0) {
+      med = median(comps.map(function (c) { return c.ratio_w; }).sort(function (a, b) { return a - b; }));
     }
     var items = comps.map(function (c) {
       var ratioText = c.ratio_w === null || c.ratio_w === undefined ? 'n/a' : fmtMult(c.ratio_w);
@@ -672,8 +615,8 @@
       basis = note + '.';
     } else if (fallback) {
       basis = 'This row takes the overall median ' + fmtMult(DATA.overall_multiple) + ' \u2014 fewer than 3 live comps in this category.';
-    } else if (n !== null && median !== null) {
-      basis = 'n=' + n + ' comps, median ' + fmtMult(median) + ', shrunk to ' + fmtMult(row.category_multiple) + '.';
+    } else if (n !== null && med !== null) {
+      basis = 'n=' + n + ' comps, median ' + fmtMult(med) + ', shrunk to ' + fmtMult(row.category_multiple) + '.';
     } else if (n !== null) {
       basis = 'n=' + n + ' live comps in this category; their median, shrunk toward the overall median, sets this row\u2019s multiple of ' + fmtMult(row.category_multiple) + '.';
     } else {
@@ -695,14 +638,13 @@
     if (items.length > 0) wrap.appendChild(el('ul', { class: 'peers' }, items));
     return wrap;
   }
-
   // The derivation beside the category multiple. It must agree with
   // comparables() below it; the row's own multiple_note states exactly
   // that, so it is used verbatim when data.js carries it.
-  function multipleDerivation(row) {
+  function multNote(row) {
     if (typeof row.multiple_note === 'string' && row.multiple_note) return row.multiple_note;
     var n = typeof row.multiple_n === 'number' ? row.multiple_n : null;
-    if (isFallbackMultiple(row)) {
+    if (isFallback(row)) {
       return n !== null ? 'n=' + n + ' comp' + (n === 1 ? '' : 's') + ' \u2014 overall median' : 'overall median \u2014 fewer than 3 live comps';
     }
     var byCat = DATA.liveByCategory && DATA.liveByCategory[row.category || ''];
@@ -711,32 +653,30 @@
     }
     var list = byCat ? (Array.isArray(byCat) ? byCat : (byCat.comps || [])) : null;
     if (n !== null && list && list.length >= n) {
-      var med = medianOf(list.map(function (r) { return r.ratio_winsorized; }).sort(function (a, b) { return a - b; }));
+      var med = median(list.map(function (r) { return r.ratio_winsorized; }).sort(function (a, b) { return a - b; }));
       if (med !== null) return 'n=' + n + ' comps, median ' + fmtMult(med) + ', shrunk to ' + fmtMult(row.category_multiple);
     }
     return 'category median, winsorized + shrunk';
   }
-
-  function eqRow(label, value, deriv) {
+  function eq(label, value, deriv) {
     var left = el('div', null, el('span', { text: label }));
     if (deriv) left.appendChild(el('div', { class: 'eq-note', text: deriv }));
     return el('div', { class: 'eq-row' }, left, el('b', { class: 'num', text: value }));
   }
-
   function openDetail(slug) {
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
     state.selected = slug;
     writeHash();
     dialog.textContent = '';
-    var steps = farmSteps(row);
+    var steps = farm(row);
     var m = DATA.model;
     var chainText = row.chains && row.chains.length
       ? row.chains.slice(0, 2).join(', ') + (row.chains.length > 2 ? ' + ' + (row.chains.length - 2) + ' more' : '')
       : 'an unnamed chain';
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
-        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? ' · watchlist' : ' · early radar') }),
+        el('span', { class: 'brand-name', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.watchlist ? ' \u00b7 watchlist' : ' \u00b7 early radar') }),
         el('h2', { id: 'detail-title', text: row.name }),
         el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + chainText })
       ),
@@ -762,14 +702,14 @@
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
-        eqRow('TVL', fmtUsd(row.tvl_usd)),
-        eqRow('Category multiple', fmtMult(row.category_multiple), multipleDerivation(row)),
-        eqRow('Seven-day growth', fmtPct(row.change_7d)),
-        eqRow('Growth multiplier', String(row.growth_multiplier), growthDeriv),
-        eqRow('Age with no token on record', fmtAge(row.age_days)),
-        eqRow('Maturity multiplier', String(row.maturity_multiplier), maturityDeriv),
-        eqRow('Chain multiplier', String(row.chain_multiplier), chainDeriv),
-        eqRow('Implied value', fmtUsd(row.implied_value_usd), impliedDeriv)
+        eq('TVL', fmtUsd(row.tvl_usd)),
+        eq('Category multiple', fmtMult(row.category_multiple), multNote(row)),
+        eq('Seven-day growth', fmtPct(row.change_7d)),
+        eq('Growth multiplier', String(row.growth_multiplier), growthDeriv),
+        eq('Age with no token on record', fmtAge(row.age_days)),
+        eq('Maturity multiplier', String(row.maturity_multiplier), maturityDeriv),
+        eq('Chain multiplier', String(row.chain_multiplier), chainDeriv),
+        eq('Implied value', fmtUsd(row.implied_value_usd), impliedDeriv)
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
     ));
@@ -777,9 +717,9 @@
       el('h3', { text: 'Farm plan' }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
-        var action = at >= 0 ? s.slice(0, at) : s;
+        var actionText = at >= 0 ? s.slice(0, at) : s;
         var tail = at >= 0 ? s.slice(at + 1) : '';
-        return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
+        return el('li', null, el('b', { text: actionText }), el('span', { class: 'cost', text: tail }));
       }))
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
@@ -792,7 +732,6 @@
       dialog.setAttribute('open', '');
     }
   }
-
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
@@ -807,7 +746,7 @@
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') {
       shell.appendChild(modelPanel());
-      shell.appendChild(multiplesTable());
+      shell.appendChild(multTable());
     }
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
